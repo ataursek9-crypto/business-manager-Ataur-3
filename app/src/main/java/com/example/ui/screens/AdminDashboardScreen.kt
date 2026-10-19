@@ -35,6 +35,7 @@ import com.example.data.model.ExpenseStatus
 import com.example.data.sync.*
 import com.example.ui.theme.*
 import com.example.util.BengaliFormatter
+import com.example.util.GoogleSignInHelper
 import com.example.util.PdfReceiptGenerator
 import com.example.viewmodel.BusinessViewModel
 import com.example.viewmodel.CustomerDueItem
@@ -63,6 +64,7 @@ fun AdminDashboardScreen(
     onNavigateToStockControl: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val summary by viewModel.adminDashboardSummary.collectAsStateWithLifecycle()
     val lowStockList by viewModel.lowStockProducts.collectAsStateWithLifecycle()
     val allExpenses by viewModel.allExpenses.collectAsStateWithLifecycle()
@@ -262,6 +264,81 @@ fun AdminDashboardScreen(
                                     Icon(Icons.Default.ContentCopy, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text("কপি", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        var isActivatingGoogle by remember { mutableStateOf(false) }
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = Color(0xFF1E3A5F),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF64B5F6).copy(alpha = 0.5f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("admin_google_signin_prompt_card")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.CloudQueue, contentDescription = null, tint = Color(0xFFFFB74D), modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "ক্লাউড বিজনেস কোড তৈরি করুন",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "সেলসম্যানের ফোন সংযুক্ত করতে গুগল সাইন-ইন আবশ্যক",
+                                            color = Color.White.copy(alpha = 0.8f),
+                                            fontSize = 10.sp
+                                        )
+                                    }
+                                }
+                                Button(
+                                    onClick = {
+                                        if (isActivatingGoogle) return@Button
+                                        isActivatingGoogle = true
+                                        GoogleSignInHelper.launchGoogleSignIn(
+                                            context = context,
+                                            scope = coroutineScope,
+                                            onAuthSuccess = { fUser ->
+                                                viewModel.handleGoogleSignInSuccess(fUser) { success, msg, _ ->
+                                                    isActivatingGoogle = false
+                                                    if (success) {
+                                                        viewModel.refreshActiveBusinessId()
+                                                        Toast.makeText(context, "ক্লাউড বিজনেস কোড সফলভাবে সক্রিয় হয়েছে!", Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                                    }
+                                                }
+                                            },
+                                            onError = { err ->
+                                                isActivatingGoogle = false
+                                                Toast.makeText(context, "গুগল সাইন-ইন ব্যর্থ: $err", Toast.LENGTH_LONG).show()
+                                            }
+                                        )
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.testTag("btn_admin_activate_cloud")
+                                ) {
+                                    if (isActivatingGoogle) {
+                                        CircularProgressIndicator(color = PrimaryNavy, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                    } else {
+                                        Text("গুগল সাইন-ইন", color = PrimaryNavy, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
                                 }
                             }
                         }

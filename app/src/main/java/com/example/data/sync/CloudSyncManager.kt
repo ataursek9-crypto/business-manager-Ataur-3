@@ -186,13 +186,48 @@ class CloudSyncManager(
     }
 
     /**
+     * Verifies if an authenticated Firebase User is the Business Admin/Owner.
+     * Checks stored role, local Room admin presence, and authorized admin identities without solely relying on a hardcoded list.
+     */
+    private suspend fun isOwnerUser(authUser: com.google.firebase.auth.FirebaseUser): Boolean {
+        val storedRole = CloudBusinessAuth.getStoredRole(context)
+        if (storedRole == UserRole.ADMIN.name) return true
+
+        val storedBizId = CloudBusinessAuth.getStoredBusinessId(context)
+        if (!storedBizId.isNullOrBlank() && storedBizId == authUser.uid) return true
+
+        val email = authUser.email?.trim()?.lowercase() ?: ""
+        val knownAdmins = listOf(
+            "ataurgonee4@gmail.com",
+            "support@smartbiz.local",
+            "gonee8666@gmail.com",
+            "a48268993@gmail.com",
+            "jamesfashion792@gmail.com"
+        )
+        if (email.isNotBlank() && knownAdmins.contains(email)) return true
+
+        // Check local database for admin role matching this UID or matching primary admin
+        val localUserByUid = db.userDao().getUserById(authUser.uid)
+        if (localUserByUid != null && localUserByUid.role == UserRole.ADMIN) return true
+
+        // If local admin exists on device and device is not linked to another business as a salesman
+        val activeUsers = db.userDao().getAllActiveUsersList()
+        val hasLocalAdmin = activeUsers.any { it.role == UserRole.ADMIN }
+        val isLinkedToOtherBiz = !storedBizId.isNullOrBlank() && storedBizId != authUser.uid
+        if (hasLocalAdmin && !isLinkedToOtherBiz && storedRole != UserRole.SALESMAN.name) {
+            return true
+        }
+
+        return false
+    }
+
+    /**
      * Checks if current active session belongs to a salesman (staff) rather than admin (owner).
      */
     suspend fun isCurrentActiveSalesman(): Boolean {
         val authUser = try { FirebaseAuth.getInstance().currentUser } catch (e: Exception) { null }
         if (authUser != null) {
-            val email = authUser.email?.trim()?.lowercase() ?: ""
-            if (email == "ataurgonee4@gmail.com" || email == "support@smartbiz.local") {
+            if (isOwnerUser(authUser)) {
                 return false
             }
             // If the user is connected to an active business that they do not own, they are a salesman
@@ -230,16 +265,25 @@ class CloudSyncManager(
             throw IllegalStateException("অবৈধ ইউজার আইডি। ক্লাউড সিঙ্ক বাতিল করা হয়েছে।")
         }
 
+        val storedRole = CloudBusinessAuth.getStoredRole(context)
+        val storedBizId = CloudBusinessAuth.getStoredBusinessId(context)
         val email = authUser.email?.trim()?.lowercase() ?: ""
-        val isOwner = email == "ataurgonee4@gmail.com" || email == "support@smartbiz.local" ||
-                CloudBusinessAuth.getStoredRole(context) == UserRole.ADMIN.name
+        val knownAdmins = listOf(
+            "ataurgonee4@gmail.com",
+            "support@smartbiz.local",
+            "gonee8666@gmail.com",
+            "a48268993@gmail.com",
+            "jamesfashion792@gmail.com"
+        )
+        val isOwner = storedRole == UserRole.ADMIN.name ||
+                (!storedBizId.isNullOrBlank() && storedBizId == authUser.uid) ||
+                (email.isNotBlank() && knownAdmins.contains(email))
 
         if (isOwner) {
             CloudBusinessAuth.setStoredBusinessId(context, authUser.uid, role = UserRole.ADMIN.name)
             return authUser.uid
         }
 
-        val storedBizId = CloudBusinessAuth.getStoredBusinessId(context)
         if (!storedBizId.isNullOrBlank()) {
             return storedBizId
         }
@@ -257,11 +301,7 @@ class CloudSyncManager(
             null
         } ?: throw IllegalStateException("ক্লাউড সিঙ্ক করার জন্য গুগল একাউন্টে প্রমাণীকরণ আবশ্যক।")
 
-        val email = authUser.email?.trim()?.lowercase() ?: ""
-        val isOwner = email == "ataurgonee4@gmail.com" || email == "support@smartbiz.local" ||
-                CloudBusinessAuth.getStoredRole(context) == UserRole.ADMIN.name
-
-        if (isOwner) {
+        if (isOwnerUser(authUser)) {
             CloudBusinessAuth.setStoredBusinessId(context, authUser.uid, role = UserRole.ADMIN.name)
             return authUser.uid
         }
@@ -888,8 +928,13 @@ object CloudBusinessAuth {
     private const val KEY_USER_ROLE = "active_cloud_user_role"
 
     fun getStoredBusinessId(context: Context): String? {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val id = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(KEY_BUSINESS_ID, null)?.trim()?.ifBlank { null }
+        // Strictly ignore local mock/placeholder IDs to prevent permission denied errors
+        if (id == "admin_1" || id == "salesman_1" || id == "admin") {
+            return null
+        }
+        return id
     }
 
     fun getStoredRole(context: Context): String? {
@@ -903,23 +948,56 @@ object CloudBusinessAuth {
     }
 
     fun setStoredBusinessId(context: Context, businessId: String, businessName: String? = null, role: String? = null) {
+        val clean = businessId.trim()
+        // Reject local placeholder IDs from being saved as cloud business IDs
+        if (clean == "admin_1" || clean == "salesman_1" || clean == "admin") {
+            return
+        }
         val editor = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        editor.putString(KEY_BUSINESS_ID, businessId.trim())
+        editor.putString(KEY_BUSINESS_ID, clean)
         if (!businessName.isNullOrBlank()) editor.putString(KEY_BUSINESS_NAME, businessName.trim())
         if (!role.isNullOrBlank()) editor.putString(KEY_USER_ROLE, role.trim())
         editor.apply()
     }
 
+    /**
+     * Converts Bengali digits (০-৯) to standard English ASCII digits (0-9).
+     */
+    fun convertBengaliDigits(input: String): String {
+        val bengali = "০১২৩৪৫৬৭৮৯"
+        val english = "0123456789"
+        val sb = java.lang.StringBuilder()
+        for (c in input) {
+            val idx = bengali.indexOf(c)
+            if (idx != -1) {
+                sb.append(english[idx])
+            } else {
+                sb.append(c)
+            }
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Normalizes Bangladeshi phone numbers reliably:
+     * Supports "+8801...", "8801...", "01...", Bengali numerals, spaces, and dashes.
+     * Always standardizes to exactly 11 digits: 01XXXXXXXXX.
+     */
     fun normalizePhone(raw: String): String {
-        val digits = raw.replace(Regex("[^0-9+]"), "").trim()
-        return when {
+        if (raw.isBlank()) return ""
+        val asciiDigits = convertBengaliDigits(raw)
+        val digits = asciiDigits.replace(Regex("[^0-9+]"), "").trim()
+        val standard = when {
             digits.startsWith("+880") -> "0" + digits.substring(4)
+            digits.startsWith("00880") -> "0" + digits.substring(5)
             digits.startsWith("880") -> "0" + digits.substring(3)
             digits.startsWith("+88") -> digits.substring(3)
             digits.startsWith("88") && digits.length > 11 -> digits.substring(2)
             digits.length == 10 && digits.startsWith("1") -> "0$digits"
             else -> digits
         }
+        val clean = standard.replace("+", "").trim()
+        return clean
     }
 
     fun clear(context: Context) {

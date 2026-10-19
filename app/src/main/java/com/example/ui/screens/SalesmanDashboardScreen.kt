@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.content.Context
 import android.content.ClipboardManager
+import android.content.ClipData
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.ui.text.style.TextOverflow
@@ -74,7 +75,9 @@ fun SalesmanDashboardScreen(
     }
 
     val activeBizId by viewModel.activeBusinessId.collectAsStateWithLifecycle()
+    val latestDiagnosticReport by viewModel.latestDiagnosticReport.collectAsStateWithLifecycle()
     var showConnectDialog by remember { mutableStateOf(false) }
+    var showDiagnosticDialog by remember { mutableStateOf(false) }
     var inputBizId by remember { mutableStateOf("") }
     var isConnecting by remember { mutableStateOf(false) }
 
@@ -875,6 +878,21 @@ fun SalesmanDashboardScreen(
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Medium
                         )
+                        if (latestDiagnosticReport != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            OutlinedButton(
+                                onClick = { showDiagnosticDialog = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("btn_view_diagnostic_report"),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(vertical = 4.dp, horizontal = 8.dp)
+                            ) {
+                                Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("বিস্তারিত ডায়াগনস্টিক রিপোর্ট দেখুন", fontSize = 11.sp)
+                            }
+                        }
                     }
                 }
             },
@@ -926,6 +944,52 @@ fun SalesmanDashboardScreen(
                     enabled = !isConnecting
                 ) {
                     Text("বাতিল")
+                }
+            }
+        )
+    }
+
+    if (showDiagnosticDialog && latestDiagnosticReport != null) {
+        val report = latestDiagnosticReport!!
+        AlertDialog(
+            onDismissRequest = { showDiagnosticDialog = false },
+            icon = {
+                Icon(Icons.Default.Assessment, contentDescription = null, tint = PrimaryNavy, modifier = Modifier.size(28.dp))
+            },
+            title = {
+                Text("ক্লাউড সংযোগ ডায়াগনস্টিক রিপোর্ট", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                        .padding(10.dp)
+                ) {
+                    Text(
+                        text = report.toFormattedReport(),
+                        fontSize = 11.sp,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Diagnostic Report", report.toFormattedReport()))
+                        Toast.makeText(context, "রিপোর্ট কপি করা হয়েছে!", Toast.LENGTH_SHORT).show()
+                    }
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("রিপোর্ট কপি")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiagnosticDialog = false }) {
+                    Text("বন্ধ করুন")
                 }
             }
         )

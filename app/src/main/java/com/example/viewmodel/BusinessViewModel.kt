@@ -24,7 +24,10 @@ import com.example.data.sync.CloudBusinessAuth
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.SetOptions
+import com.example.data.sync.ConnectionDiagnosticReport
+
 
 data class DashboardSummary(
     val todaySales: Double = 0.0,
@@ -72,18 +75,31 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
     )
     val activeBusinessId: StateFlow<String> = _activeBusinessId.asStateFlow()
 
+    private val _latestDiagnosticReport = MutableStateFlow<ConnectionDiagnosticReport?>(null)
+    val latestDiagnosticReport: StateFlow<ConnectionDiagnosticReport?> = _latestDiagnosticReport.asStateFlow()
+
+    fun clearDiagnosticReport() {
+        _latestDiagnosticReport.value = null
+    }
+
     fun getActiveBusinessId(): String {
         val fUid = try { FirebaseAuth.getInstance().currentUser?.uid } catch (_: Exception) { null }
         val current = _currentUser.value
         val stored = CloudBusinessAuth.getStoredBusinessId(getApplication())
 
-        // When admin is signed in with Google, enforce the Firebase Auth UID as the active business ID
-        if (current?.role == UserRole.ADMIN && !fUid.isNullOrBlank()) {
-            if (stored != fUid) {
-                CloudBusinessAuth.setStoredBusinessId(getApplication(), fUid, role = UserRole.ADMIN.name)
+        // When admin is signed in with Google, enforce the authentic Firebase Auth UID as the active business ID
+        if (current?.role == UserRole.ADMIN) {
+            if (!fUid.isNullOrBlank()) {
+                if (stored != fUid) {
+                    CloudBusinessAuth.setStoredBusinessId(getApplication(), fUid, role = UserRole.ADMIN.name)
+                }
+                _activeBusinessId.value = fUid
+                return fUid
+            } else {
+                // Admin has not signed in with Google yet: NEVER expose local placeholder IDs ("admin_1") to prevent PERMISSION_DENIED
+                _activeBusinessId.value = ""
+                return ""
             }
-            _activeBusinessId.value = fUid
-            return fUid
         }
 
         // Return stored if non-blank and not the local placeholder
@@ -92,12 +108,7 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
             return stored
         }
 
-        if (current != null && current.role == UserRole.ADMIN) {
-            val id = fUid ?: current.id
-            CloudBusinessAuth.setStoredBusinessId(getApplication(), id, role = UserRole.ADMIN.name)
-            _activeBusinessId.value = id
-            return id
-        }
+        _activeBusinessId.value = ""
         return ""
     }
 
@@ -120,36 +131,93 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
         val cleanPin = pin.trim()
 
         if (cleanBizId.isBlank()) {
-            onResult(false, "সঠিক ক্লাউড বিজনেস কোড দিন!")
+            val msg = "সঠিক ক্লাউড বিজনেস কোড দিন!"
+            _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                stepName = "শুরুর যাচাই (Input Validation)",
+                briefReason = msg,
+                errorCode = "EMPTY_BUSINESS_CODE"
+            )
+            onResult(false, msg)
             return
         }
+
+        // Reject local placeholder IDs immediately
+        if (cleanBizId == "admin_1" || cleanBizId == "salesman_1" || cleanBizId == "admin") {
+            val msg = "অবৈধ বিজনেস কোড ('$cleanBizId')! অ্যাডমিন ফোনে গুগল সাইন-ইন করে ড্যাশবোর্ডে প্রদর্শিত আসল ফায়ারবেস বিজনেস আইডি কপি করে দিন।"
+            _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                stepName = "বিজনেস কোড বৈধতা যাচাই",
+                errorCode = "INVALID_PLACEHOLDER_CODE",
+                briefReason = msg,
+                businessCodeMasked = cleanBizId
+            )
+            onResult(false, msg)
+            return
+        }
+
         viewModelScope.launch {
             val fUser = try { FirebaseAuth.getInstance().currentUser } catch (_: Exception) { null }
             if (fUser == null || fUser.uid.isBlank()) {
-                onResult(false, "ক্লাউড ব্যবসার সাথে যুক্ত হতে গুগল সাইন-ইন আবশ্যক!")
+                val msg = "ক্লাউড ব্যবসার সাথে যুক্ত হতে গুগল সাইন-ইন আবশ্যক!"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "গুগল প্রমাণীকরণ (Google Auth)",
+                    errorCode = "UNAUTHENTICATED",
+                    briefReason = msg,
+                    isSignedIn = false,
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId)
+                )
+                onResult(false, msg)
                 return@launch
             }
 
             val firestore = FirebaseFirestore.getInstance()
+            val rawPhone = cleanPhone.ifBlank { _currentUser.value?.phone ?: "" }
+            val resolvedPhone = CloudBusinessAuth.normalizePhone(rawPhone)
 
             // Step 1: Verify business doc exists
             val bizDoc = try {
                 Log.i("BusinessLinking", "[ConnectFlow] Step 1: Reading business doc /businesses/$cleanBizId")
                 firestore.collection("businesses").document(cleanBizId).get().await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "READ_ERROR"
                 Log.e("BusinessLinking", "[ConnectFlow] Step 1 Failed (READ_BUSINESS_DOC): /businesses/$cleanBizId - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
-                    "[ধাপ ১: READ /businesses] ব্যবসা কোড যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস কনসোলে Rules পাবলিশ করা আছে কি না যাচাই করুন।"
+                val reason = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                    "ব্যবসা কোড যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস কনসোলে Rules পাবলিশ করা আছে কি না যাচাই করুন।"
                 } else {
-                    "[ধাপ ১: READ /businesses] ব্যবসা কোড যাচাই ব্যর্থ: $err"
+                    "ব্যবসা কোড যাচাই ব্যর্থ: $err"
                 }
-                onResult(false, msg)
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ১: ব্যবসা কোড যাচাই (Verify Business)",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId",
+                    errorCode = code,
+                    briefReason = reason,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ১] $reason")
                 return@launch
             }
 
             if (!bizDoc.exists()) {
-                onResult(false, "এই বিজনেস কোড ($cleanBizId) ক্লাউডে পাওয়া যায়নি! সঠিক কোড লিখুন।")
+                val msg = "এই বিজনেস কোডটি ক্লাউডে পাওয়া যায়নি! অ্যাডমিন ফোনে গুগল সাইন-ইন করে সঠিক কোড কপি করেছেন কি না নিশ্চিত হন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ১: ব্যবসা কোড যাচাই (Verify Business)",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId",
+                    errorCode = "NOT_FOUND",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ১] $msg")
                 return@launch
             }
 
@@ -162,7 +230,7 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     .collection("staff").document(fUser.uid).get().await()
                 if (existingStaffDoc.exists() && (existingStaffDoc.getBoolean("isActive") == true)) {
                     val staffName = existingStaffDoc.getString("name") ?: (fUser.displayName ?: "সেলস প্রতিনিধি")
-                    val staffPhone = existingStaffDoc.getString("phone") ?: cleanPhone
+                    val staffPhone = existingStaffDoc.getString("phone") ?: resolvedPhone
 
                     CloudBusinessAuth.setStoredBusinessId(
                         context = getApplication(),
@@ -185,6 +253,20 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     _currentUser.value = localUser
 
                     syncManager.triggerSync { success, msg ->
+                        _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                            stepName = "ধাপ ২: বিদ্যমান স্টাফ লিঙ্ক ও সিঙ্ক",
+                            operationType = "SYNC",
+                            documentPath = "/businesses/$cleanBizId/staff/${fUser.uid}",
+                            briefReason = if (success) "পূর্বে অনুমোদিত থাকায় সফলভাবে পুনঃসংযুক্ত ও সিঙ্ক হয়েছে।" else "অ্যাকাউন্ট যুক্ত আছে কিন্তু ডেটা সিঙ্ক ব্যর্থ: $msg",
+                            rawExceptionMessage = if (!success) msg else "",
+                            errorCode = if (success) "SUCCESS" else "SYNC_ERROR",
+                            isSignedIn = true,
+                            authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                            authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                            businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                            phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone),
+                            isSuccess = success
+                        )
                         if (success) {
                             onResult(true, "ব্যবসার সাথে সফলভাবে যুক্ত আছেন! সমস্ত পণ্য ও স্টক সিঙ্ক সম্পন্ন।")
                         } else {
@@ -198,12 +280,17 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
             }
 
             // Step 3: Require registered Phone & PIN for strict security verification
-            val rawPhone = cleanPhone.ifBlank { _currentUser.value?.phone ?: "" }
-            val resolvedPhone = CloudBusinessAuth.normalizePhone(rawPhone)
-            val resolvedPin = cleanPin
-
-            if (resolvedPhone.isBlank() || resolvedPin.isBlank()) {
-                onResult(false, "অনুমোদন ত্রুটি: অ্যাডমিন কর্তৃক নিবন্ধিত মোবাইল নম্বর এবং গোপন পিন কোড দিন!")
+            if (resolvedPhone.isBlank() || cleanPin.isBlank()) {
+                val msg = "অনুমোদন ত্রুটি: অ্যাডমিন কর্তৃক নিবন্ধিত মোবাইল নম্বর এবং গোপন পিন কোড দিন!"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: স্টাফ নম্বর ও পিন যাচাই",
+                    errorCode = "EMPTY_PHONE_OR_PIN",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId)
+                )
+                onResult(false, msg)
                 return@launch
             }
 
@@ -212,43 +299,90 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 firestore.collection("businesses").document(cleanBizId)
                     .collection("staff_by_phone").document(resolvedPhone).get().await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "READ_ERROR"
                 Log.e("BusinessLinking", "[ConnectFlow] Step 3 Failed (READ_STAFF_BY_PHONE): /businesses/$cleanBizId/staff_by_phone - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
-                    "[ধাপ ৩: READ /staff_by_phone] স্টাফ নম্বর যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে staff_by_phone পড়ার অনুমতি নেই।"
+                val reason = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                    "স্টাফ নম্বর যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে staff_by_phone পড়ার অনুমতি নেই।"
                 } else {
-                    "[ধাপ ৩: READ /staff_by_phone] স্টাফ নম্বর যাচাই ব্যর্থ: $err"
+                    "স্টাফ নম্বর যাচাই ব্যর্থ: $err"
                 }
-                onResult(false, msg)
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: স্টাফ নম্বর অনুমোদন যাচাই",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId/staff_by_phone/$resolvedPhone",
+                    errorCode = code,
+                    briefReason = reason,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৩] $reason")
                 return@launch
             }
 
             if (!staffPhoneDoc.exists()) {
-                onResult(false, "অননুমোদিত স্টাফ: মোবাইল নম্বরটি ($resolvedPhone) অ্যাডমিন ক্লাউডে নিবন্ধন করেননি অথবা অ্যাডমিন ফোন থেকে এখনও 'ক্লাউড সিঙ্ক' করা হয়নি। অ্যাডমিনকে ফোনে গিয়ে স্টাফ নম্বর যোগ এবং ক্লাউড সিঙ্ক করতে বলুন।")
+                val msg = "অননুমোদিত স্টাফ: মোবাইল নম্বরটি ($resolvedPhone) অ্যাডমিন ক্লাউডে নিবন্ধন করেননি অথবা অ্যাডমিন ফোন থেকে এখনও 'ক্লাউড সিঙ্ক' করা হয়নি। অ্যাডমিনকে ফোনে গিয়ে স্টাফ নম্বর যোগ এবং ক্লাউড সিঙ্ক করতে বলুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: স্টাফ নম্বর অনুমোদন যাচাই",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId/staff_by_phone/$resolvedPhone",
+                    errorCode = "STAFF_NOT_FOUND_IN_CLOUD",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৩] $msg")
                 return@launch
             }
 
             val isActive = staffPhoneDoc.getBoolean("isActive") ?: false
             if (!isActive) {
-                onResult(false, "এই স্টাফ অ্যাকাউন্টটি নিষ্ক্রিয় বা স্থগিত করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।")
+                val msg = "এই স্টাফ অ্যাকাউন্টটি নিষ্ক্রিয় বা স্থগিত করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: স্টাফ অ্যাকাউন্ট সক্রিয়তা যাচাই",
+                    errorCode = "STAFF_INACTIVE",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৩] $msg")
                 return@launch
             }
 
             // Cryptographic PIN verification
             val expectedPinHash = staffPhoneDoc.getString("pinHash")
-            val providedPinHash = repository.hashPin(resolvedPin)
-            val localAuth = repository.authenticateUser(resolvedPhone, resolvedPin)
+            val providedPinHash = repository.hashPin(cleanPin)
+            val localAuth = repository.authenticateUser(resolvedPhone, cleanPin)
 
             val isPinValid = if (!expectedPinHash.isNullOrBlank()) {
                 expectedPinHash == providedPinHash
             } else if (localAuth is BusinessRepository.AuthResult.Success) {
                 true
             } else {
-                resolvedPin == "1234"
+                cleanPin == "1234"
             }
 
             if (!isPinValid) {
-                onResult(false, "ভুল পিন কোড! অ্যাডমিনের দেওয়া সঠিক পিন কোড দিয়ে চেষ্টা করুন।")
+                val msg = "ভুল পিন কোড! অ্যাডমিনের দেওয়া সঠিক পিন কোড দিয়ে চেষ্টা করুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: পিন কোড যাচাই",
+                    errorCode = "INVALID_PIN",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৩] $msg")
                 return@launch
             }
 
@@ -271,14 +405,28 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 )
                 staffDocRef.set(staffData, SetOptions.merge()).await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "WRITE_ERROR"
                 Log.e("BusinessLinking", "[ConnectFlow] Step 4 Failed (WRITE_STAFF_PROFILE): /businesses/$cleanBizId/staff/${fUser.uid} - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
-                    "[ধাপ ৪: WRITE /staff] স্টাফ প্রোফাইল তৈরি অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস সিকিউরিটি রুলস অনুযায়ী স্টাফ লিঙ্ক করার অনুমতি মেলেনি।"
+                val reason = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                    "স্টাফ প্রোফাইল তৈরি অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস সিকিউরিটি রুলস অনুযায়ী স্টাফ লিঙ্ক করার অনুমতি মেলেনি।"
                 } else {
-                    "[ধাপ ৪: WRITE /staff] স্টাফ প্রোফাইল সংরক্ষণ ব্যর্থ: $err"
+                    "স্টাফ প্রোফাইল সংরক্ষণ ব্যর্থ: $err"
                 }
-                onResult(false, msg)
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৪: স্টাফ প্রোফাইল লিঙ্ক (Write Staff Profile)",
+                    operationType = "SET",
+                    documentPath = "/businesses/$cleanBizId/staff/${fUser.uid}",
+                    errorCode = code,
+                    briefReason = reason,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৪] $reason")
                 return@launch
             }
 
@@ -298,14 +446,28 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     SetOptions.merge()
                 ).await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "WRITE_ERROR"
                 Log.e("BusinessLinking", "[ConnectFlow] Step 5 Failed (WRITE_STAFF_MEMBERSHIP): /staff_memberships/${fUser.uid} - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
-                    "[ধাপ ৫: WRITE /staff_memberships] স্টাফ মেম্বারশিপ ইনডেক্স অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে /staff_memberships আপডেট ব্লক করা হয়েছে।"
+                val reason = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                    "স্টাফ মেম্বারশিপ ইনডেক্স অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে /staff_memberships আপডেট ব্লক করা হয়েছে।"
                 } else {
-                    "[ধাপ ৫: WRITE /staff_memberships] স্টাফ মেম্বারশিপ সংরক্ষণ ব্যর্থ: $err"
+                    "স্টাফ মেম্বারশিপ সংরক্ষণ ব্যর্থ: $err"
                 }
-                onResult(false, msg)
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৫: গ্লোবাল মেম্বারশিপ ইনডেক্স (Staff Membership Index)",
+                    operationType = "SET",
+                    documentPath = "/staff_memberships/${fUser.uid}",
+                    errorCode = code,
+                    briefReason = reason,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone)
+                )
+                onResult(false, "[ধাপ ৫] $reason")
                 return@launch
             }
 
@@ -331,13 +493,27 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
             repository.saveUserDirect(localUser)
             _currentUser.value = localUser
 
-            // Step 7: Trigger immediate sync
+            // Step 7: Trigger immediate sync - separate connect status from sync status
             Log.i("BusinessLinking", "[ConnectFlow] Step 7: Triggering cloud sync")
             syncManager.triggerSync { success, msg ->
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৭: ক্লাউড ডেটা সিঙ্ক",
+                    operationType = "SYNC",
+                    documentPath = "/businesses/$cleanBizId/products",
+                    errorCode = if (success) "SUCCESS" else (if (msg.contains("PERMISSION_DENIED")) "PERMISSION_DENIED" else "SYNC_ERROR"),
+                    briefReason = if (success) "কানেকশন ও ক্লাউড ডেটা সিঙ্ক সম্পূর্ণ সফল!" else "স্টাফ অ্যাকাউন্ট যুক্ত হয়েছে, কিন্তু প্রাথমিক ডেটা সিঙ্ক ব্যর্থ: $msg",
+                    rawExceptionMessage = if (!success) msg else "",
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(fUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(fUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(resolvedPhone),
+                    isSuccess = success
+                )
                 if (success) {
                     onResult(true, "ব্যবসার সাথে সফলভাবে যুক্ত হয়েছেন! সমস্ত পণ্য ও স্টক সিঙ্ক সম্পন্ন।")
                 } else {
-                    onResult(false, "[ধাপ ৭: সিঙ্ক] স্টাফ অ্যাকাউন্ট লিঙ্ক হয়েছে, কিন্তু ক্লাউড ডেটা সিঙ্ক ব্যর্থ: $msg")
+                    onResult(true, "ব্যবসার সাথে অ্যাকাউন্ট সফলভাবে যুক্ত হয়েছে! কিন্তু ডেটা সিঙ্কে বার্তা: $msg (ড্যাশবোর্ড থেকে ক্লাউড সিঙ্ক বাটনে ট্যাপ করে পুনরায় সিঙ্ক করতে পারেন)")
                 }
             }
         }
@@ -962,6 +1138,14 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     return@launch
                 }
                 _currentUser.value = existingUserByUid
+                if (existingUserByUid.role == UserRole.ADMIN) {
+                    CloudBusinessAuth.setStoredBusinessId(
+                        context = getApplication(),
+                        businessId = uid,
+                        role = UserRole.ADMIN.name
+                    )
+                    _activeBusinessId.value = uid
+                }
                 onResult(true, "স্বাগতম, ${existingUserByUid.name}!", existingUserByUid.role)
                 return@launch
             }
@@ -978,18 +1162,30 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     val linkedUser = existingUserByPhone.copy(id = uid)
                     repository.saveUserDirect(linkedUser)
                     _currentUser.value = linkedUser
+                    if (linkedUser.role == UserRole.ADMIN) {
+                        CloudBusinessAuth.setStoredBusinessId(
+                            context = getApplication(),
+                            businessId = uid,
+                            role = UserRole.ADMIN.name
+                        )
+                        _activeBusinessId.value = uid
+                    }
                     onResult(true, "স্বাগতম, ${linkedUser.name}!", linkedUser.role)
                     return@launch
                 }
             }
 
-            // 3. Check if this is the registered primary business owner (ataurgonee4@gmail.com or authorized admin email)
-            val isPrimaryOwner = cleanEmail.isNotBlank() && repository.isAuthorizedAdminEmail(cleanEmail)
+            // 3. Check if this is the registered business admin/owner
+            val canClaimAdmin = cleanEmail.isNotBlank() && (
+                repository.isAuthorizedAdminEmail(cleanEmail) ||
+                repository.canClaimAdminOwnership(cleanEmail) ||
+                _currentUser.value?.role == UserRole.ADMIN
+            )
 
-            if (isPrimaryOwner) {
+            if (canClaimAdmin) {
                 val adminUser = User(
                     id = uid,
-                    name = name.ifBlank { "মোঃ আতাউর রহমান" },
+                    name = name.ifBlank { "এডমিন" },
                     phone = phone.ifBlank { "01700000000" },
                     role = UserRole.ADMIN,
                     pinHash = repository.hashPin("1234"),
@@ -1076,11 +1272,36 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
             val cleanPin = pin.trim()
 
             if (cleanBizId.isBlank()) {
-                onResult(false, "অ্যাডমিনের ক্লাউড বিজনেস কোড দিন!", null)
+                val msg = "অ্যাডমিনের ক্লাউড বিজনেস কোড দিন!"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "শুরুর যাচাই (Input Validation)",
+                    errorCode = "EMPTY_BUSINESS_CODE",
+                    briefReason = msg
+                )
+                onResult(false, msg, null)
                 return@launch
             }
+
+            if (cleanBizId == "admin_1" || cleanBizId == "salesman_1" || cleanBizId == "admin") {
+                val msg = "অবৈধ বিজনেস কোড ('$cleanBizId')! অ্যাডমিন ফোনে গুগল সাইন-ইন করে ড্যাশবোর্ডে প্রদর্শিত আসল ফায়ারবেস বিজনেস আইডি কপি করে দিন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "বিজনেস কোড বৈধতা যাচাই",
+                    errorCode = "INVALID_PLACEHOLDER_CODE",
+                    briefReason = msg,
+                    businessCodeMasked = cleanBizId
+                )
+                onResult(false, msg, null)
+                return@launch
+            }
+
             if (cleanPhone.isBlank() || cleanPin.isBlank()) {
-                onResult(false, "মোবাইল নম্বর এবং পিন কোড সঠিকভাবে লিখুন!", null)
+                val msg = "মোবাইল নম্বর এবং পিন কোড সঠিকভাবে লিখুন!"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "শুরুর যাচাই (Input Validation)",
+                    errorCode = "EMPTY_PHONE_OR_PIN",
+                    briefReason = msg
+                )
+                onResult(false, msg, null)
                 return@launch
             }
 
@@ -1091,19 +1312,46 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 Log.i("BusinessLinking", "[LinkFlow] Step 1: Reading business doc /businesses/$cleanBizId")
                 firestore.collection("businesses").document(cleanBizId).get().await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "READ_ERROR"
                 Log.e("BusinessLinking", "[LinkFlow] Step 1 Failed (READ_BUSINESS_DOC): /businesses/$cleanBizId - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                val msg = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
                     "[ধাপ ১: READ /businesses] ব্যবসা কোড যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস কনসোলে Rules পাবলিশ করা আছে কি না যাচাই করুন।"
                 } else {
                     "[ধাপ ১: READ /businesses] ব্যবসা কোড যাচাই ব্যর্থ: $err"
                 }
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ১: ব্যবসা কোড যাচাই (Verify Business)",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId",
+                    errorCode = code,
+                    briefReason = msg,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
                 onResult(false, msg, null)
                 return@launch
             }
 
             if (!bizDoc.exists()) {
-                onResult(false, "এই বিজনেস কোড ($cleanBizId) ক্লাউডে পাওয়া যায়নি! অ্যাডমিনের সঠিক কোড দিন।", null)
+                val msg = "এই বিজনেস কোড ($cleanBizId) ক্লাউডে পাওয়া যায়নি! অ্যাডমিনের সঠিক কোড দিন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ১: ব্যবসা কোড যাচাই (Verify Business)",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId",
+                    errorCode = "NOT_FOUND",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
+                onResult(false, msg, null)
                 return@launch
             }
             val bizName = bizDoc.getString("businessName") ?: "স্মার্ট বিজনেস"
@@ -1152,29 +1400,62 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 firestore.collection("businesses").document(cleanBizId)
                     .collection("staff_by_phone").document(cleanPhone).get().await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "READ_ERROR"
                 Log.e("BusinessLinking", "[LinkFlow] Step 2 Failed (READ_STAFF_BY_PHONE): /businesses/$cleanBizId/staff_by_phone - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                val msg = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
                     "[ধাপ ২: READ /staff_by_phone] স্টাফ নম্বর যাচাই অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে staff_by_phone পড়ার অনুমতি নেই।"
                 } else {
                     "[ধাপ ২: READ /staff_by_phone] স্টাফ নম্বর যাচাই ব্যর্থ: $err"
                 }
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ২: স্টাফ নম্বর অনুমোদন যাচাই",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId/staff_by_phone/$cleanPhone",
+                    errorCode = code,
+                    briefReason = msg,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
                 onResult(false, msg, null)
                 return@launch
             }
 
             if (!staffPhoneDoc.exists()) {
-                onResult(
-                    false,
-                    "অননুমোদিত স্টাফ: মোবাইল নম্বরটি ($cleanPhone) অ্যাডমিন ক্লাউডে নিবন্ধন করেননি অথবা অ্যাডমিন ফোন থেকে এখনও 'ক্লাউড সিঙ্ক' করা হয়নি। অ্যাডমিনকে ফোনে গিয়ে স্টাফ নম্বর যোগ এবং ক্লাউড সিঙ্ক করতে বলুন।",
-                    null
+                val msg = "অননুমোদিত স্টাফ: মোবাইল নম্বরটি ($cleanPhone) অ্যাডমিন ক্লাউডে নিবন্ধন করেননি অথবা অ্যাডমিন ফোন থেকে এখনও 'ক্লাউড সিঙ্ক' করা হয়নি। অ্যাডমিনকে ফোনে গিয়ে স্টাফ নম্বর যোগ এবং ক্লাউড সিঙ্ক করতে বলুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ২: স্টাফ নম্বর অনুমোদন যাচাই",
+                    operationType = "GET",
+                    documentPath = "/businesses/$cleanBizId/staff_by_phone/$cleanPhone",
+                    errorCode = "STAFF_NOT_FOUND_IN_CLOUD",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
                 )
+                onResult(false, msg, null)
                 return@launch
             }
 
             val isActive = staffPhoneDoc.getBoolean("isActive") ?: false
             if (!isActive) {
-                onResult(false, "এই স্টাফ অ্যাকাউন্টটি নিষ্ক্রিয় বা স্থগিত করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।", null)
+                val msg = "এই স্টাফ অ্যাকাউন্টটি নিষ্ক্রিয় বা স্থগিত করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ২: স্টাফ অ্যাকাউন্ট সক্রিয়তা যাচাই",
+                    errorCode = "STAFF_INACTIVE",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
+                onResult(false, msg, null)
                 return@launch
             }
 
@@ -1191,7 +1472,17 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
             }
 
             if (!isPinValid) {
-                onResult(false, "ভুল পিন কোড! অ্যাডমিনের দেওয়া সঠিক পিন কোড দিয়ে চেষ্টা করুন।", null)
+                val msg = "ভুল পিন কোড! অ্যাডমিনের দেওয়া সঠিক পিন কোড দিয়ে চেষ্টা করুন।"
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ২: পিন কোড যাচাই",
+                    errorCode = "INVALID_PIN",
+                    briefReason = msg,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
+                onResult(false, msg, null)
                 return@launch
             }
 
@@ -1215,13 +1506,27 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 )
                 staffDocRef.set(staffData, SetOptions.merge()).await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "WRITE_ERROR"
                 Log.e("BusinessLinking", "[LinkFlow] Step 3 Failed (WRITE_STAFF_PROFILE): /businesses/$cleanBizId/staff/${firebaseUser.uid} - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                val msg = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
                     "[ধাপ ৩: WRITE /staff] স্টাফ প্রোফাইল তৈরি অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস সিকিউরিটি রুলস অনুযায়ী স্টাফ লিঙ্ক করার অনুমতি মেলেনি।"
                 } else {
                     "[ধাপ ৩: WRITE /staff] স্টাফ প্রোফাইল সংরক্ষণ ব্যর্থ: $err"
                 }
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৩: স্টাফ প্রোফাইল লিঙ্ক (Write Staff Profile)",
+                    operationType = "SET",
+                    documentPath = "/businesses/$cleanBizId/staff/${firebaseUser.uid}",
+                    errorCode = code,
+                    briefReason = msg,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
                 onResult(false, msg, null)
                 return@launch
             }
@@ -1242,13 +1547,27 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                     SetOptions.merge()
                 ).await()
             } catch (e: Exception) {
+                val code = (e as? FirebaseFirestoreException)?.code?.name ?: "WRITE_ERROR"
                 Log.e("BusinessLinking", "[LinkFlow] Step 4 Failed (WRITE_STAFF_MEMBERSHIP): /staff_memberships/${firebaseUser.uid} - ${e.message}")
                 val err = e.localizedMessage ?: e.message ?: "ত্রুটি"
-                val msg = if (err.contains("PERMISSION_DENIED", ignoreCase = true)) {
+                val msg = if (code == "PERMISSION_DENIED" || err.contains("PERMISSION_DENIED", ignoreCase = true)) {
                     "[ধাপ ৪: WRITE /staff_memberships] স্টাফ মেম্বারশিপ ইনডেক্স অনুমতি ত্রুটি (PERMISSION_DENIED): ফায়ারবেস রুলসে /staff_memberships আপডেট ব্লক করা হয়েছে।"
                 } else {
                     "[ধাপ ৪: WRITE /staff_memberships] স্টাফ মেম্বারশিপ সংরক্ষণ ব্যর্থ: $err"
                 }
+                _latestDiagnosticReport.value = ConnectionDiagnosticReport(
+                    stepName = "ধাপ ৪: গ্লোবাল মেম্বারশিপ ইনডেক্স",
+                    operationType = "SET",
+                    documentPath = "/staff_memberships/${firebaseUser.uid}",
+                    errorCode = code,
+                    briefReason = msg,
+                    rawExceptionMessage = err,
+                    isSignedIn = true,
+                    authUidMasked = ConnectionDiagnosticReport.maskId(firebaseUser.uid),
+                    authEmailMasked = ConnectionDiagnosticReport.maskEmail(firebaseUser.email ?: ""),
+                    businessCodeMasked = ConnectionDiagnosticReport.maskId(cleanBizId),
+                    phoneMasked = ConnectionDiagnosticReport.maskPhone(cleanPhone)
+                )
                 onResult(false, msg, null)
                 return@launch
             }
@@ -1576,18 +1895,52 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
         val current = _currentUser.value ?: return
         if (current.role != UserRole.ADMIN) return
         viewModelScope.launch {
+            val normalizedPhone = CloudBusinessAuth.normalizePhone(phone.trim())
             val hashed = repository.hashPin(rawPin.trim())
             val newUser = User(
                 id = "salesman_${System.currentTimeMillis()}",
                 name = name.trim(),
-                phone = phone.trim(),
+                phone = normalizedPhone.ifBlank { phone.trim() },
                 role = UserRole.SALESMAN,
                 pinHash = hashed,
                 canDiscount = canDiscount,
                 accountStatus = UserAccountStatus.ACTIVE
             )
             repository.saveUser(newUser, current)
-            _toastMessage.emit("নতুন সেলসম্যান সফলভাবে তৈরি হয়েছে")
+
+            // Direct cloud registration if Admin is authenticated with Google
+            val fUid = try { FirebaseAuth.getInstance().currentUser?.uid } catch (_: Exception) { null }
+            if (!fUid.isNullOrBlank() && fUid != "admin_1" && fUid != "admin") {
+                try {
+                    val firestore = FirebaseFirestore.getInstance()
+                    val staffData = mapOf(
+                        "id" to newUser.id,
+                        "name" to newUser.name,
+                        "phone" to normalizedPhone,
+                        "role" to UserRole.SALESMAN.name,
+                        "isActive" to true,
+                        "canDiscount" to canDiscount,
+                        "businessId" to fUid,
+                        "pinHash" to hashed,
+                        "updatedAt" to System.currentTimeMillis()
+                    )
+                    firestore.collection("businesses").document(fUid)
+                        .collection("staff").document(newUser.id)
+                        .set(staffData, SetOptions.merge()).await()
+
+                    if (normalizedPhone.isNotBlank()) {
+                        firestore.collection("businesses").document(fUid)
+                            .collection("staff_by_phone").document(normalizedPhone)
+                            .set(staffData, SetOptions.merge()).await()
+                    }
+                    _toastMessage.emit("নতুন সেলসম্যান ক্লাউড ও লোকাল সিস্টেমে সফলভাবে সংরক্ষিত হয়েছে!")
+                } catch (e: Exception) {
+                    Log.e("AdminStaff", "Direct staff cloud registration failed: ${e.message}", e)
+                    _toastMessage.emit("সেলসম্যান লোকালভাবে তৈরি হয়েছে। ক্লাউড আপলোড বাকি: ${e.message}")
+                }
+            } else {
+                _toastMessage.emit("সেলসম্যান লোকালভাবে তৈরি হয়েছে। সেলসম্যানকে ক্লাউডে যুক্ত করতে গুগল সাইন-ইন করে ক্লাউড সিঙ্ক করুন।")
+            }
             syncManager.triggerSync()
             onDone()
         }

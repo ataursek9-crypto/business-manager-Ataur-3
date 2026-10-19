@@ -683,6 +683,7 @@ fun SalesmenManagementScreen(
     BackHandler { onBack() }
     val context = LocalContext.current
     val users by viewModel.users.collectAsStateWithLifecycle()
+    val activeBizId by viewModel.activeBusinessId.collectAsStateWithLifecycle()
     var showAddDialog by remember { mutableStateOf(false) }
 
     // Status Change Dialog State
@@ -1004,6 +1005,34 @@ fun SalesmenManagementScreen(
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (activeBizId.isNotBlank()) Color(0xFFE8F5E9) else Color(0xFFFFF8E1),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                if (activeBizId.isNotBlank()) Icons.Default.CloudDone else Icons.Default.CloudOff,
+                                contentDescription = null,
+                                tint = if (activeBizId.isNotBlank()) AccentGreen else AccentAmber,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (activeBizId.isNotBlank())
+                                    "ক্লাউড সক্রিয়: সেলসম্যানের ক্লাউড রেজিস্ট্রেশন হবে।"
+                                else
+                                    "সতর্কতা: গুগল সাইন-ইন না থাকায় এটি শুধুমাত্র লোকাল মোডে সেভ হবে।",
+                                fontSize = 11.sp,
+                                color = if (activeBizId.isNotBlank()) AccentGreen else Color(0xFF8D6E00),
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = canDiscount, onCheckedChange = { canDiscount = it })
                         Text("ডিসকাউন্ট দেওয়ার অনুমতি দিন", fontSize = 13.sp)

@@ -679,7 +679,23 @@ class BusinessRepository(
 
     fun isAuthorizedAdminEmail(email: String): Boolean {
         val clean = email.trim().lowercase()
-        return clean == "ataurgonee4@gmail.com" || clean == "support@smartbiz.local" || clean == "gonee8666@gmail.com" || clean == "a48268993@gmail.com"
+        if (clean.isBlank()) return false
+        val knownAdmins = listOf(
+            "ataurgonee4@gmail.com",
+            "support@smartbiz.local",
+            "gonee8666@gmail.com",
+            "a48268993@gmail.com",
+            "jamesfashion792@gmail.com"
+        )
+        return knownAdmins.contains(clean)
+    }
+
+    suspend fun canClaimAdminOwnership(email: String): Boolean {
+        val clean = email.trim().lowercase()
+        if (isAuthorizedAdminEmail(clean)) return true
+        // If device has a local admin configured, permit that admin to bind their Google identity
+        val adminUsers = db.userDao().getAllActiveUsersList().filter { it.role == UserRole.ADMIN }
+        return adminUsers.isNotEmpty()
     }
 
     suspend fun updateAdminSecurityCredentials(
