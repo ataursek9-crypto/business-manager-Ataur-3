@@ -274,6 +274,107 @@ class BusinessRepository(
             if (existingAdmin != null && existingAdmin.name != "মোঃ আতাউর রহমান") {
                 db.userDao().updateUser(existingAdmin.copy(name = "মোঃ আতাউর রহমান"))
             }
+            if (includeSampleDemoData && db.productDao().getAllProductsList().isEmpty()) {
+                val sampleProducts = listOf(
+                    Product(
+                        id = "p_1",
+                        name = "মিনিকেট চাল (৫০ কেজি বস্তা)",
+                        sku = "RICE-50",
+                        barcode = "8941001",
+                        category = "মুদি ও খাদ্য",
+                        purchasePrice = 3100.0,
+                        sellingPrice = 3450.0,
+                        currentStock = 45.0,
+                        alertStockLevel = 10.0,
+                        unit = "বস্তা",
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    ),
+                    Product(
+                        id = "p_2",
+                        name = "তীর সোয়াবিন তেল (৫ লিটার)",
+                        sku = "OIL-5L",
+                        barcode = "8941002",
+                        category = "তেল ও চর্বি",
+                        purchasePrice = 780.0,
+                        sellingPrice = 850.0,
+                        currentStock = 30.0,
+                        alertStockLevel = 8.0,
+                        unit = "বোতল",
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    ),
+                    Product(
+                        id = "p_3",
+                        name = "মেঘনা চিনি (৫০ কেজি)",
+                        sku = "SUGAR-50",
+                        barcode = "8941003",
+                        category = "মুদি ও খাদ্য",
+                        purchasePrice = 6200.0,
+                        sellingPrice = 6600.0,
+                        currentStock = 20.0,
+                        alertStockLevel = 5.0,
+                        unit = "বস্তা",
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    ),
+                    Product(
+                        id = "p_4",
+                        name = "মসুর ডাল (দেশি)",
+                        sku = "LENTIL-1KG",
+                        barcode = "8941004",
+                        category = "মুদি ও খাদ্য",
+                        purchasePrice = 125.0,
+                        sellingPrice = 145.0,
+                        currentStock = 120.0,
+                        alertStockLevel = 25.0,
+                        unit = "কেজি",
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    )
+                )
+                sampleProducts.forEach { db.productDao().insertProduct(it) }
+
+                val sampleCustomers = listOf(
+                    Customer(
+                        id = "c_1",
+                        name = "মেসার্স রফিক ব্রাদার্স",
+                        phone = "01711223344",
+                        address = "চকবাজার, ঢাকা",
+                        totalBilled = 15000.0,
+                        totalPaid = 10000.0,
+                        currentDue = 5000.0,
+                        isPinned = true,
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    ),
+                    Customer(
+                        id = "c_2",
+                        name = "জননী স্টোর (কালাম ভাই)",
+                        phone = "01722334455",
+                        address = "মিরপুর-১০, ঢাকা",
+                        totalBilled = 8500.0,
+                        totalPaid = 8500.0,
+                        currentDue = 0.0,
+                        isPinned = false,
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    ),
+                    Customer(
+                        id = "c_3",
+                        name = "ভাই ভাই এন্টারপ্রাইজ",
+                        phone = "01833445566",
+                        address = "উত্তরা সেক্টর ৭",
+                        totalBilled = 22000.0,
+                        totalPaid = 14000.0,
+                        currentDue = 8000.0,
+                        isPinned = false,
+                        isTestData = true,
+                        testTag = "SAMPLE_SEED"
+                    )
+                )
+                sampleCustomers.forEach { db.customerDao().insertCustomer(it) }
+            }
         }
     }
 
@@ -692,10 +793,7 @@ class BusinessRepository(
 
     suspend fun canClaimAdminOwnership(email: String): Boolean {
         val clean = email.trim().lowercase()
-        if (isAuthorizedAdminEmail(clean)) return true
-        // If device has a local admin configured, permit that admin to bind their Google identity
-        val adminUsers = db.userDao().getAllActiveUsersList().filter { it.role == UserRole.ADMIN }
-        return adminUsers.isNotEmpty()
+        return isAuthorizedAdminEmail(clean)
     }
 
     suspend fun updateAdminSecurityCredentials(

@@ -1200,14 +1200,17 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                 )
                 _activeBusinessId.value = uid
                 _currentUser.value = adminUser
-                syncManager.triggerSync()
+                if (syncManager.isCloudBackendConfigured()) {
+                    syncManager.triggerSync()
+                }
                 onResult(true, "এডমিন প্যানেলে স্বাগতম, ${adminUser.name}!", UserRole.ADMIN)
                 return@launch
             }
 
             // 4. Check if this Google user has a registered staff membership in Firestore
             try {
-                if (FirebaseApp.getApps(getApplication()).isNotEmpty()) {
+                val currentAuth = try { com.google.firebase.auth.FirebaseAuth.getInstance().currentUser } catch (_: Exception) { null }
+                if (currentAuth != null && currentAuth.uid == uid && FirebaseApp.getApps(getApplication()).isNotEmpty()) {
                     val firestore = FirebaseFirestore.getInstance()
                     val memberDoc = withTimeoutOrNull(2500L) {
                         firestore.collection("staff_memberships").document(uid).get().await()
@@ -1235,7 +1238,9 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                             )
                             _activeBusinessId.value = bizId
                             _currentUser.value = staffUser
-                            triggerSync()
+                            if (syncManager.isCloudBackendConfigured()) {
+                                triggerSync()
+                            }
                             onResult(true, "স্বাগতম, ${staffUser.name}!", role)
                             return@launch
                         }
@@ -1662,7 +1667,9 @@ class BusinessViewModel(application: Application) : AndroidViewModel(application
                             role = linkedUser.role.name
                         )
                         _activeBusinessId.value = existingBizId
-                        triggerSync()
+                        if (syncManager.isCloudBackendConfigured()) {
+                            triggerSync()
+                        }
                     }
                     onResult(true, "গুগল অ্যাকাউন্ট সফলভাবে লিংক করা হয়েছে! স্বাগতম, ${linkedUser.name}!", linkedUser.role)
                 }
